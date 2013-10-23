@@ -1,0 +1,1117 @@
+### Ctrl + Alt + R runs full page
+##### Load Packages ########
+#source("http://bioconductor.org/biocLite.R"); biocLite("lumi")
+#library(lumi)
+#require(limma)
+#require(gplots)
+#biocLite("lumiHumanAll.db")
+#require(biomaRt)
+#biocLite("ChIPpeakAnno")
+#require(ChIPpeakAnno)
+##############################
+
+SpeciesTable <- data.frame (species=c("human", "mouse", "rat"), 
+							lumi.mapping = c("lumiHumanIDMapping", "lumiMouseIDMapping", "lumiRatIDMapping"),
+							mart = c("hsapiens_gene_ensembl","mmusculus_gene_ensembl","rnorvegicus_gene_ensembl"),
+							symbolDB = c("hgnc_symbol", "mgi_symbol", "rat_symbol"))
+rownames(SpeciesTable)<-SpeciesTable$species
+
+
+######################################
+##      Load and Preprocess         ##
+######################################
+Load_lumi_Data <- function(Sample_Probe_File, Control_Probe_File, organism,Include=NULL){
+  
+  
+  ##  Load Data   ##
+  ##################
+  
+  species <- SpeciesTable[organism,]
+  if(!is.installed(species$lumi.mapping)){
+    source("http://bioconductor.org/biocLite.R"); biocLite(species$lumi.mapping) }
+  x.lumi <- lumiR(Sample_Probe_File)
+  Control<-read.delim(Control_Probe_File, header=T,sep="\t")
+  numSamples <- dim(exprs(x.lumi))[[2]]
+  ControlAvgs <- Control[,c(1:2,seq(3,2*numSamples+2,by=2))]
+  colnames(ControlAvgs) <- c("TargetID", "ProbeID", colnames(exprs(x.lumi)))
+  if(!missing(Include)){ ControlAvgs <- ControlAvgs[,c(1:2,2+Include)]}
+  #	x.lumi<-addControlData2lumi(ControlAvgs, x.lumi)
+  
+  ##  Normalize   ##
+  ##################
+  
+  if(!missing(Include)){
+    subset.lumi <- new('LumiBatch', exprs = exprs(x.lumi[,Include]), se.exprs = se.exprs(x.lumi[,Include]), beadNum = beadNum(x.lumi[,Include]), detection = detection(x.lumi[,Include]), phenoData = phenoData(x.lumi[,Include]))
+    lumi.N <- lumiExpresso(subset.lumi, bg.correct=FALSE, variance.stabilize=FALSE, normalize.param = list(method='quantile'))
+  }else{ 	lumi.N <- lumiExpresso(x.lumi, bg.correct=FALSE, variance.stabilize=FALSE, normalize.param = list(method='quantile'))
+  }#quantile normalize each array, without background correction or VST normalization
+  lumi.NT <- lumiT(lumi.N, method="log2")
+  #perform log2 normalization
+  
+  x.Vals <- exprs(lumi.NT)
+  AllprobeIDmapping <- probeID2nuID(rownames(x.Vals), species$lumi.mapping)
+  
+  return (list(NormalizedData=x.Vals, ControlData = ControlAvgs, AllProbeMapping = AllprobeIDmapping, lumi.N=lumi.N, lumi.NT=lumi.NT, RawData=x.lumi) )
+  
+}
+
+#######################
+ProcessData <- function(NormalizedData, Groups, organism, IDMapping=NULL, ControlData=NULL, NonTransformedData=NULL, cols=NULL){
+
+	species <- SpeciesTable[organism,]
+	if(missing(cols)){cols=1:dim(NormalizedData)[[2]]}
+	numSamples <- length(Groups)
+	if(missing(ControlData)){ print("Using all probes"); present=1:dim(NormalizedData)[[1]]
+	}else{
+		print(paste("Limiting probes according to ", dim(ControlData)[[1]], "Control probes"))
+		NegControl <- ControlData[ControlData[,which(names(ControlData)=="TargetID")]=="NEGATIVE",]
+		groups <- lapply(unique(Groups), function(g){which(Groups==g)})
+		present <- DetectionThreshold75(NonTransformedData[, cols], NegControl[,cols+2], groups) 
+			# allow for 1 or 0 probes in a set to fall below 75% negative threshold
+	}
+	selDataMatrix <- NormalizedData[present,] 
+	if(missing(IDMapping)){
+		probeIDmapping <- probeID2nuID(rownames(selDataMatrix), lib.mapping=species$lumi.mapping)
+	}else{ 	probeIDmapping <- IDMapping
+	}
+	return (list(Values=selDataMatrix, ProbeMapping = probeIDmapping) )
+
+}
+
+########### DetectionThreshold75
+##   	takes 2 matrices of real data and negative controls 
+##		returns vector of T/F stating if at least 1 row grouping has 2 or more values greater than 75% neg threshold
+##		groups is a list where each list element contains column numbers for array that belong to each group
+###########
+DetectionThreshold75 <- function(lumiBatch, NegControl, groups){
+  
+  Threshold75 <- apply(NegControl, 2, quantile)[4,]
+  x.Vals = c();
+  if(is.matrix(lumiBatch)){x.Vals<- lumiBatch
+  } else if(class(lumiBatch)=="LumiBatch"){x.Vals<- exprs(lumiBatch)
+  } else {return ("lumiBatch must either be a Matrix or of class LumiBatch")}
+  
+  x.FilteredVals <- x.Vals
+  
+  for(i in 1:dim(NegControl)[[2]]) x.FilteredVals[x.FilteredVals[,i]<Threshold75[i],i] <- NA
+  ThresholdPass <- apply(x.FilteredVals, 1, function(row){
+    NAvals <- lapply(groups, function(g){  length(which(is.na(row[g])))	})
+    any(NAvals<2)
+  })
+  
+  ThresholdPass
+}
+
+########### DetectionThreshold75_g
+## 		takes a matrix containing both real data and negative controls 
+##		returns vector of T/F stating if row groupings have more than NumExist values greater than 75% neg threshold
+###########
+DetectionThreshold75_g <- function(x.Vals, NegControl, Cases, NumExist, groups){
+  # x.Vals=all array expression data, NegControl=IDs for rows for negative control, Cases=IDs for rows for real data (not positive/negative controls), 
+  # groups= list of which arrays belong to each condition, NumExist=minimum number of arrays that pass threshold in each group necessary for keeping probe
+  
+  Threshold75 <- apply(x.Vals[NegControl,], 2, quantile, na.rm=TRUE)[4,]		#get the 75% threshold for each array (columns)
+  
+  x.FilteredVals <-x.Vals
+  for(i in 1:dim(x.Vals)[[2]]) x.FilteredVals[x.FilteredVals[,i]<Threshold75[i],i] <- NA
+  ThresholdPass <- apply(x.FilteredVals, 1, function(row){
+    NAvals <- lapply(groups, function(g){  length(which(is.na(row[g])))	})
+    any(NAvals<NumExist)
+  })
+  
+  ThresholdPass
+}
+
+##############################
+##  Find Diff Expr Genes    ##
+##############################
+DifferentialExpression <- function(Data, design, IDMapping, SymbolCol=NULL, cont.matrix=NULL){
+
+	if(missing(SymbolCol)) SymbolCol=2
+#	cat(SymbolCol, "\n")
+	fit<- lmFit(Data, design)
+	if(!missing(cont.matrix)){	fit <- contrasts.fit(fit, cont.matrix) }
+	fit <- eBayes(fit)
+
+	fit$genes <- data.frame(ID= rownames(Data), geneSymbol=IDMapping[,SymbolCol])
+	return (fit)
+}
+
+##########################################
+## All Pairwise Differential Expression ##
+##########################################
+AllPairwiseDifferentialExpression<-function(Data, ComparisonTable, groups, reps, Condpos=NULL, Process=TRUE, IDMapping=NULL, SymbolCol=2){
+
+	Comparisons <- apply(ComparisonTable, 1, paste, collapse="_")
+
+	AllCompare<-apply(ComparisonTable, 1, function(row){
+		testable<- apply(ComparisonTable, 1, function(row2){
+			length(which(row!=row2))==1
+		})
+		which(testable)
+	})
+	PairwiseCompare<-c()
+	for(i in 1:(dim(AllCompare)[[2]]-1)){ PairwiseCompare<-rbind(PairwiseCompare, cbind(i, AllCompare[AllCompare[,i]>i,i]))}
+	nCompare <- dim(PairwiseCompare)[[1]]
+
+	### which group columns to compare in pairwise comparison
+	if(length(reps)==1){
+		PairwiseCols <- t(apply(PairwiseCompare,1,function(x){c(seq(reps*x[1]-reps+1,reps*x[1]),seq(reps*x[2]-reps+1,reps*x[2]) )}))
+		if(!is.list(PairwiseCols)){PairwiseCols<-split(PairwiseCols, 1:nCompare)}
+	}else{
+		if(missing(Condpos)){ print("Condition Positions missing.  Quitting."); return();
+		}else{
+			PairwiseCols <- apply(PairwiseCompare,1,function(x){c(seq(Condpos[x[1]],Condpos[x[1]]+reps[x[1]]-1),seq(Condpos[x[2]],Condpos[x[2]]+reps[x[2]]-1) )})
+		}
+	}
+	
+	if(Process==TRUE){
+		cat("Process is TRUE: \n", Process)
+		ProcessedList <- lapply(PairwiseCols, function(cols){ProcessData(NormalizedData=Data$NormalizedData, ControlData=Data$ControlData, NonTransformedData=Data$lumi.N, cols=cols, Groups=groups[cols], organism)})
+	}else{ 	cat("Process is FALSE: \n", Process)
+		ProcessedList <- lapply(PairwiseCols, function(cols){ProcessData(NormalizedData=Data, IDMapping= IDMapping, cols=cols, Groups=groups[cols], organism)}) }
+	DesignList <- lapply(1:nCompare, function(row){f<-factor(groups);	#f<-factor(groups[PairwiseCols[[row]]]);
+													m<-model.matrix(~0+f); 
+												colnames(m)<-sapply(colnames(m),function(name){substr(name,2,nchar(name))});
+												m})
+
+	ContMtxList<-lapply(1:nCompare, function(row){ do.call("makeContrasts",args=list(contrasts=paste(unique(groups)[PairwiseCompare[row,]], collapse="-"), 
+																				levels=DesignList[[row]]))})
+
+	AnalyzedList <- lapply(1:nCompare, function(x){ do.call("DifferentialExpression", args=list(
+		Data=ProcessedList[[x]]$Values, design=DesignList[[x]], IDMapping=ProcessedList[[x]]$ProbeMapping, SymbolCol= SymbolCol, cont.matrix=ContMtxList[[x]]))})
+
+	result <- list(Comparisons=Comparisons, PairedComparisons=PairwiseCompare, nCompare=nCompare, ProcessedList=ProcessedList, fit=AnalyzedList)
+	return(result)
+}
+
+###################################
+generate_AllPairwiseData<- function(Sample_Probe_File, Control_Probe_File, ComparisonTable, rootfile, arrayPos, Condpos, alpha=0.05){
+
+	require(plyr)
+
+	lumi_Data <- Load_lumi_Data(Sample_Probe_File, Control_Probe_File, Include=arrayPos, organism)
+		# list of NormalizedData,  ControlData, AllProbeMapping, lumi.N, lumi.NT, RawData
+
+	Symbols <- lumi_Data$AllProbeMapping[,2]
+	Refseq_g <- sapply(lumi_Data$AllProbeMapping[,3], function(x){sub("\\.\\d+","",x)})
+
+	PairwiseResults <- AllPairwiseDifferentialExpression(Data=lumi_Data, ComparisonTable, groups=Groups[arrayPos], reps=reps, Condpos=Condpos)
+
+	## Print topTable for all pairwise comparisons
+	for(x in 1:PairwiseResults$nCompare){
+		logFC <- do.call("topTable", args=list(fit=PairwiseResults$fit[[x]], number=dim(PairwiseResults$fit[[x]]$p.value)[[1]], coef=1))
+		filename<-paste(rootfile,colnames(PairwiseResults$fit[[x]]$contrasts), "_topTable.txt",sep="")
+		do.call("write.table", args=list(x=logFC, file=filename, quote=F, row.names=F, col.names=T, sep="\t"))
+	} 
+
+	## Get Direction of significance for raw pval and FDR pval given defined alpha
+	for(x in 1:PairwiseResults$nCompare){
+		Raw <- Significant_Direction(PairwiseResults$fit[[x]], alpha=alpha, pval="raw", coef=1)
+		FDR <- Significant_Direction(PairwiseResults$fit[[x]], alpha=alpha, pval="FDR", coef=1)
+		PairwiseResults$fit[[x]]$"Dir_pval" <- Raw$sig
+		PairwiseResults$fit[[x]]$"Dir_FDR" <- FDR$sig
+		PairwiseResults$fit[[x]]$"FC" <- FDR$FC
+		PairwiseResults$fit[[x]]$"FDR" <- FDR$val
+	}
+
+	DataTable <- data.frame(ID=rownames(lumi_Data$NormalizedData), Symbol=lumi_Data$AllProbeMapping[,2], Description=GPL13475[rownames(lumi_Data$NormalizedData),6], 
+						Refseq_p = lumi_Data$AllProbeMapping[,1], Refseq_g=Refseq_g)
+	for(fit in PairwiseResults$fit){
+		DataTable<-join(DataTable, data.frame(ID=rownames(fit$genes), fit$Dir_pval, fit$Dir_FDR, fit$FC, fit$FDR, fit$p.value), by="ID")
+ 	}
+	DataTable <-cbind(DataTable,lumi_Data$NormalizedData)
+	names(DataTable)[6:(5+5*PairwiseResults$nCompare)]<-paste(c("DirPval", "DirFDR", "FC", "FDR", "pval"), rep(apply(PairwiseResults$PairedComparisons, 1, function(row){paste(PairwiseResults$Comparisons[row], collapse="-")}), each=5), sep="_")
+
+	write.table(DataTable[,c(1:5,2+5*1:PairwiseResults$nCompare,3+5*1:PairwiseResults$nCompare,4+5*1:PairwiseResults$nCompare,(6+5*PairwiseResults$nCompare):dim(DataTable)[2], 1+5*1:PairwiseResults$nCompare,5+5*1:PairwiseResults$nCompare)], file=paste(rootfile,'ProbeMarkedVals_AllPairwise_alpha05.txt', sep=""), quote=F, row.names=F, col.names=T, sep="\t", na="")
+
+	return(list(lumi_Data=lumi_Data, Symbols=Symbols, PairwiseResults=PairwiseResults, DataTable=DataTable))
+}
+
+###########################
+##   Write GSEA Files    ##
+###########################
+writeGSEAfiles<- function(Data, IDMapping, Groups, rootFile, ChIPfile, SymbolCols=c(2,3)){
+	## Expession File (must change first 2 column names to NAME and Description, although Description optional)
+	cat("NAME",colnames(Data), "\n", sep="\t", 	file=paste(rootFile, "ProbeVals.txt", sep="_"))
+
+#	cat("NAME",colnames(Data), "\n", sep="\t", 	file=paste(rootFile, "_ProbeVals_", Sys.Date(), ".txt", sep=""))
+	write.table(Data, 
+				file=paste(rootFile, "_ProbeVals.txt", sep=""),
+				quote=F, col.names=F, row.names=T, sep="\t", append=T)
+
+	## Class File
+	cat(paste(length(Groups), length(unique(Groups)), "1", "\n# ",  sep=" "), 
+		unique(Groups), "\n", Groups,
+		file=paste(rootFile, "_Phenotypes.cls", sep=""))
+
+	## ChIP File (must have "Probe Set ID", "Gene Symbol", and "Gene Title" columns)
+	cat("Probe Set ID", "Gene Symbol", "Gene Title", "\n", sep="\t", file=ChIPfile)
+	write.table(IDMapping[,SymbolCols], 
+		file=ChIPfile, quote=F, col.names=F, row.names=T, sep="\t", append=TRUE)
+}
+
+#################
+## KEGG 
+writeKEGGfile_fromFit<- function(Data,fit, file, organism, alpha){
+	species <- SpeciesTable[organism,]
+	UpDown <- sapply(fit$coefficients[fit$p.value<alpha,], function(x){ifelse(x<0,"green", "red")})
+
+	refseq <- sapply(Data$ProbeMapping[names(UpDown),3], function(x){sub("\\.\\d+","",x)})
+	entrezgene<-	getBM(attributes=c("refseq_mrna", "entrezgene"), filters="refseq_mrna", values=refseq, mart=useMart(biomart="ensembl", dataset=as.character(species$mart)))
+
+	write.table(cbind(entrezgene[match(refseq, entrezgene[,1]),2], UpDown), file, quote=F, row.names=F, col.names=F, sep="\t")
+}
+
+## requires Mark and ProbeMapping to be in same order, ProbeMapping assumed to already have version stripped
+writeKEGGfile_refseq2entrez<- function(Mark,ProbeMapping, Symbols=c("+","-"), color=c("green", "red"), DupColor="blue", file, organism){
+	species <- SpeciesTable[organism,]
+	names(color)<-Symbols
+	UpDown <- sapply(Mark[which(Mark %in% Symbols)], function(x){color[[x]]})
+	refseq <- ProbeMapping[which(Mark %in% Symbols)]
+
+	dup_refs <-unique(refseq[which(duplicated(refseq))])
+	for(dup in dup_refs){
+	if(length(unique(UpDown[which(refseq==dup)]))>1)UpDown[which(refseq==dup)]=DupColor }
+	
+	UpDown <- UpDown[!duplicated(refseq)]
+	refseq <- refseq[!duplicated(refseq)]
+	
+	if(length(refseq)==0){print(paste(file, "failed", sep=" ")); return()}
+	print(paste("Writing for: ",file, sep=""))
+	
+	entrezgene<-	getBM(attributes=c("refseq_mrna", "entrezgene"), filters="refseq_mrna", values=refseq, mart=useMart(biomart="ensembl", dataset=as.character(species$mart)))
+
+	#Check that duplicate entrezgenes are in same direction
+	for(dupGUIDpos in which(duplicated(entrezgene[,2]))){
+		dupPositions <- which(refseq %in% entrezgene[which(entrezgene[,2]==entrezgene[dupGUIDpos,2]),1])
+		if(length(unique(UpDown[dupPositions]))>1)UpDown[dupPositions]=DupColor 
+	}
+
+	EntrezColor <- cbind(entrezgene[match(refseq, entrezgene[,1]),2], UpDown)
+	EntrezColor <- EntrezColor[!is.na(EntrezColor[,1]), ]
+
+	write.table(EntrezColor, file, quote=F, row.names=F, col.names=F, sep="\t")
+}
+
+## requires Mark and ProbeMapping to be in same order, ProbeMapping assumed to already have version stripped
+writeKEGGfile<- function(IDMark, Symbols=c("+","-"), color=c("green", "red"), DupColor="blue", file){
+	#IDMark: 2 cols-first is ID, second is Symbol
+	IDMark[,"Color"] <- sapply(IDMark[,2], function(x){color[match(x, Symbols)]})
+	write.table(IDMark[,c(1,3)], file, quote=F, row.names=F, col.names=F, sep="\t")
+}
+
+################
+## is.installed
+##		checks to see if library or package is installed already
+################
+is.installed <- function(mypkg) is.element(mypkg, installed.packages()[,1]) 
+
+
+########## PROFILE PLOTS ###############
+################ profile.plot
+##     plots expression values across arrays and conditions
+profile.plot<- function(ID,Vals, IDMapping, SymbolCol=2,Conditions=NULL,Cells=NULL, fit=NULL, sampleCols=NULL, IDisRow=FALSE, sameScale=F, screen=1){		#row is the name of the row, e.g. "3800474"
+# ID is either gene name or gene ID (IDisRow indicates ID is geneID), Vals: matrix of which vals to plot, Conditions labels Val columns, Cells accounts for different cell conditions
+# fit is the test for pval indicators, sampleCols subsets conditons based on sample types
+
+	if(!IDisRow){		#gene name passed instead of gene ID
+		ID <- rownames(IDMapping)[IDMapping[,SymbolCol] %in% ID]
+	}
+	if(screen==1){ screenNum=screen; 	split.screen( figs = c( 1, length(ID) ))
+	} else {screenNum=screen+1; 	split.screen( figs = c( 1, length(ID) ), screen = screen ) }
+
+
+
+	if(missing(sampleCols)) sampleCols=seq(1,dim(Vals)[[2]])
+	if(missing(Conditions)) Conditions=colnames(Vals)
+	
+	color <- rep("black", length(sampleCols))
+	if(!missing(Cells) & length(unique(Cells))>1) {
+		CellTypes <- unique(Cells)
+		for(i in 1:length(CellTypes)){
+			color[which(Cells %in%  CellTypes[i])] <- rainbow(length(CellTypes))[i]
+		}
+	}
+
+	Bars = unique(Conditions)
+	maxVal<- max(Vals[ID,sampleCols]);minVal<- min(Vals[ID,sampleCols])	
+	
+	
+	for(row in ID){
+		screen(screenNum)
+		if(!sameScale){maxVal<- max(Vals[row,sampleCols]);minVal<- min(Vals[row,sampleCols])	}
+		barplot( rep(0, length(Bars)), space=0, names.arg=unique(Conditions), ylim=c(minVal-1,maxVal+1), main=IDMapping[row, SymbolCol], sub=row, las=2)
+
+		for(x in 1:length(Bars)){
+			samples <- which(Conditions %in%  Bars[x])
+			points(rep(x-0.5, length(samples)), pch=19, cex=0.8,
+					Vals[row,sampleCols[samples]],  col=color[samples]) 
+		}
+		
+		if(!missing(fit)){
+			i=1
+			apply(fit$p.value, 2, function(test){
+				pch=ifelse(test[row]<0.01, "*", "-")
+				points(i, minVal-0.75, pch=pch, col="red", cex=1.5)		
+				i = i+1
+			})
+		}
+		screenNum = screenNum+1
+	}
+
+}
+
+################ profile.boxplot
+profile.boxplot<- function(ID,Vals, IDMapping, SymbolCol=2,Conditions=NULL,color="white", sampleCols=NULL, IDisRow=FALSE){		#row is the name of the row, e.g. "3800474"
+	# ID is either gene name or gene ID (IDisRow indicates ID is geneID), Vals: matrix of which vals to plot, Conditions labels Val columns, Cells accounts for different cell conditions
+	# sampleCols subsets conditons based on sample types
+
+	if(!IDisRow){		#gene name passed instead of gene ID
+		ID <- rownames(IDMapping)[IDMapping[,SymbolCol] %in% ID]
+		par(mfcol=c(1,length(ID)))
+	}
+
+	if(missing(sampleCols)) sampleCols=seq(1,dim(Vals)[[2]])
+	Groups <- factor(Conditions[sampleCols], levels=unique(Conditions[sampleCols]))
+	
+	for(row in ID){
+		cat(class(Vals[row,sampleCols]))
+		boxplot(Vals[row,sampleCols]~Groups, col=color, main=paste(row,": ", IDMapping[row, SymbolCol]))		
+	}
+
+}
+
+################  profile.lineplot
+##     plots expression values across arrays and conditions
+profile.lineplot<- function(ID,Vals, IDMapping, SymbolCol=2,Conditions=NULL,color=NULL, sampleCols=NULL, IDisRow=FALSE, SummaryStat="mean", Title=NULL, collapse=FALSE, LabDir=1, add=F){		#row is the name of the row, e.g. "3800474"
+	# ID is either gene name or gene ID (IDisRow indicates ID is geneID), Vals: matrix of which vals to plot, Conditions labels Val columns, Cells accounts for different cell conditions
+	# sampleCols subsets conditons based on sample types
+
+	if(!IDisRow){		#gene name passed instead of gene ID
+		ID <- rownames(IDMapping)[IDMapping[,SymbolCol] %in% ID]
+	}
+
+	if(missing(sampleCols)) sampleCols=seq(1,dim(Vals)[[2]])
+	if(missing(color)) color=rainbow(length(ID))
+	if(missing(Title)) Title = IDMapping[ID[1], SymbolCol]
+
+	Bars = unique(Conditions[sampleCols])
+	Vals<-Vals[ID,sampleCols]
+	maxVal<- max(Vals);minVal<- min(Vals)	
+	Offset=0
+	
+	if(collapse==TRUE){ 
+		RowDiffs <- apply(Vals, 1, function(row){maxRow<- max(row); minRow<-min(row); diff<-maxRow-minRow; diff}) 
+		minVal<- -max(RowDiffs); maxVal<- max(RowDiffs)
+	}
+	if(!add)
+	barplot( rep(0, length(Bars)), space=0, names.arg=unique(Conditions), ylim=c(minVal-0.5,maxVal+0.5), main=Title)
+
+	Groups <- factor(Conditions[sampleCols], levels=Bars)
+	i=0
+	for(row in ID){ i=i+1
+		
+		Stat<-lapply(split(t(Vals[row,]), Groups), SummaryStat, na.rm=TRUE)
+		if(collapse==TRUE) Offset=Stat[[1]]
+		if(length(color)==1) {			lines(1:length(Bars)-0.5, lapply(Stat, function(x){x-Offset}), col=color, lwd=3, las=LabDir)		
+		}else{	lines(1:length(Bars)-0.5, lapply(Stat, function(x){x-Offset}), col=color[i], lwd=3, las=LabDir)		}
+	}
+
+	legend(5,y=maxVal+0.5, legend=ID, lty=1, col=color, lwd=3)
+}
+
+################ profile.3dscatterplot
+##     plots expression values across arrays and conditions
+profile.scatterplot<- function(ID,Vals, IDMapping, SymbolCol=2,Conditions=NULL,color=NULL, sampleCols=NULL, IDisRow=FALSE, x=NULL, y=NULL){		#row is the name of the row, e.g. "3800474"
+	# ID is either gene name or gene ID (IDisRow indicates ID is geneID), Vals: matrix of which vals to plot, Conditions labels Val columns, Cells accounts for different cell conditions
+	# sampleCols subsets conditons based on sample types
+	
+		require(scatterplot3d)
+
+	if(!IDisRow){		#gene name passed instead of gene ID
+		ID <- rownames(IDMapping)[IDMapping[,SymbolCol] %in% ID]
+	}
+
+	if(missing(sampleCols)) sampleCols=seq(1,dim(Vals)[[2]])
+	if(missing(color)) color=rainbow(length(ID))
+	
+	Bars = unique(Conditions[sampleCols])
+	Vals<-Vals[ID,sampleCols]
+	maxVal<- max(Vals);minVal<- min(Vals)	
+#	barplot( rep(0, length(Bars)), space=0, names.arg=unique(Conditions), ylim=c(minVal-0.5,maxVal+0.5), main=IDMapping[ID[1], SymbolCol])
+	maxplot <- scatterplot3d(x, y, z=rep(maxVal, length(y)), color="black", pch=19)	
+
+	Groups <- factor(Conditions[sampleCols], levels=Bars)
+	i=0
+	for(row in ID){ i=i+1
+		means<-lapply(split(t(Vals[row,]), Groups), mean, na.rm=TRUE)
+		maxplot$points3d(x, y, z=means, col=color[i], pch=19)		
+	}
+
+#	legend(5,y=maxVal+0.5, legend=ID, lty=1, col=color, lwd=3)
+}
+
+
+################## VennMembers
+VennMembers <- function(y, InGroup=NULL, NotInGroup=NULL){		#lists
+	if(is.null(InGroup) & is.null(NotInGroup)) return("Must specify region of interest.")
+	
+	In = sapply(InGroup, function(x) y %in% x )
+	NotIn = sapply(NotInGroup, function(x) !(y %in% x ))
+	if(is.null(InGroup)) {		 	TestRegion = NotIn
+	}else if(is.null(NotInGroup)) { TestRegion = In
+	}else {						 	TestRegion = cbind(In, NotIn) }
+	GeneInRegion <- apply(TestRegion, 1, function(x){return(length(which(x))==length(x))})
+	GeneInRegion
+}
+
+###############
+## Significant_Direction
+##		takes the fit data and determines if the change is significantly Up or Down and returns the Fold Change and P-value
+##############
+Significant_Direction<- function(fit, alpha=0.01, pval=c("raw", "FDR"), coef=1){
+
+	p.val <- fit$p.value[,coef]
+	npass= length(p.val)
+	if(pval == "FDR") { 
+		p.val <- topTable(fit, number=npass, coef=coef)$adj.P.Val;	
+		names(p.val) <- topTable(fit, number=npass, coef=coef)$ID
+		p.val<-p.val[as.character(fit$genes$ID)]
+	}
+	
+	Direction <- rep("", npass)	
+	Direction[which(fit$coefficients[,coef]<0 & p.val< alpha)] <- "-"
+	Direction[which(fit$coefficients[,coef]>0 & p.val< alpha)] <- "+"
+
+	data.frame(ID=fit$genes$ID, sig = Direction, val=p.val, FC=fit$coefficients[,coef])
+}
+
+#################
+removeEl <- function(X, element=NULL){
+	for(el in element){if(el %in% X) X <- X[-which(X == el)]}
+	return(X)
+}
+
+###############
+MakeVennMatrix <- function( Table, Conditions, SetCols, colNames=NULL, SymCol=2, maxGeneShown=20){
+
+	numSets = length(SetCols)
+	if(length(Conditions)^numSets>100){ print("Over 100 comparisons.  Not allowing it"); return()}
+	
+
+	VennMatrix<-expand.grid(data.frame(matrix(rep(Conditions, times=numSets), ncol=numSets)))
+
+	if(!missing(colNames)){colnames(VennMatrix)<- colNames}
+	
+	VennList<-apply(VennMatrix,1,function(pattern){rownames(Table[which(apply(Table[,SetCols],1,function(row){
+													all(row==pattern) }) ),]) })
+
+ 	VennMatrix$numProbes <- sapply(VennList , length)
+ 	VennGenes  <- lapply(VennList , function(set){unique(Table[set,SymCol])})
+	 VennMatrix$numGenes <- sapply(VennGenes, length)
+ 	#Genes with FDR p<0.05
+ 
+	 VennMatrix$geneNames<-sapply(1:length(VennList),function(num){ Genes <- as.character(unique(Table[VennList[[num]],SymCol]))
+ 		if(length(Genes)>maxGeneShown){Genes<-c(Genes[1:maxGeneShown], "...")}
+ 		paste(Genes, collapse=",")})
+ 		
+ 	return(list(Matrix=VennMatrix, ProbeList=VennList))
+}
+
+###################
+CollapseSecondaryID_byPrimaryID <- function(Pairs){
+
+	primaryKeys <- Pairs[,1]
+	SecondaryKeys <-sapply(unique(primaryKeys), function(key) { paste(unique(Pairs[key == Pairs[,1],2]), collapse=",")})
+	data.frame(primary=unique(primaryKeys), secondary=SecondaryKeys)
+}
+
+########## GO DATA ###########
+##############################
+getGeneSet_GO <- function(Data_FC, IDs, FileRoot, SymCol=2, orgAnn="org.Hs.eg.db"){
+	#IDs: list of rownames in Data_FC given different conditions
+		
+	GO_list<- lapply(IDs, function(Set){
+		Set_GO <- getGOdata(as.vector(unique(Data_FC[unlist(Set),SymCol])), orgAnn=orgAnn)
+			#list of comparisons (BP, MF, CC) with matrix of go terms (unique ID) that are significant, last element [,11] is list of entrezgene numbers 
+
+#		dim(unique(Set_GO[[1]][,1:10]));	dim(unique(Set_GO[[2]][,1:10]));	dim(unique(Set_GO[[3]][,1:10]))
+		Set_GO
+	})
+	
+	Set_GOmatrix <- makeGOmatrix(GeneGOsets=GO_list)
+
+	write.table(Set_GOmatrix[[1]], file=paste(FileRoot,"GOmatrixBP.txt", sep="_"), quote=F, row.names=F, col.names=T)
+	write.table(Set_GOmatrix[[2]], file=paste(FileRoot,"GOmatrixMF.txt", sep="_"), quote=F, row.names=F, col.names=T)
+	write.table(Set_GOmatrix[[3]], file=paste(FileRoot,"GOmatrixCC.txt", sep="_"), quote=F, row.names=F, col.names=T)
+
+	list(matrix=Set_GOmatrix, list=GO_list)
+}
+
+###################
+getGOdata <- function(GeneSet, idType="gene_symbol", pval=0.05, adjusted="ABH", orgAnn="org.Hs.eg.db" ){
+
+	print("Getting GO enrichment...")
+	GOdata <- getEnrichedGO(GeneSet, orgAnn=orgAnn, feature_id_type=idType, maxP=pval, multiAdj=TRUE, minGOterm=1, multiAdjMethod=adjusted)
+
+	print("Create matrix.")
+	GOmatrix <- lapply(GOdata, function(ontology){unique(ontology[,1:10]) })
+		
+	for(i in 1:3){	
+		GOmatrix[[i]]$entrez <- sapply(GOmatrix[[i]]$go.id, function(id){
+			paste(GOdata[[i]][GOdata[[i]]$go.id==id,11], collapse=", ")
+		})
+		rownames(GOmatrix[[i]])<- GOmatrix[[i]]$go.id
+	}
+	GOmatrix
+}
+
+########################
+makeGOmatrix <- function(GeneGOsets){
+	#GeneGOsets is a list of gene sets, with every 3 corresponding to bp, mf, cc
+	
+	numSets <- length(GeneGOsets)
+	
+	BP <- do.call(rbind, lapply(GeneGOsets,function(Geneset){Geneset[[1]]}))
+	BP_mtx <- unique(BP[,c(1,2)])
+	rownames(BP_mtx) <- BP_mtx[,1]
+	
+	MF <- do.call(rbind, lapply(GeneGOsets,function(Geneset){Geneset[[2]]}))
+	MF_mtx <- unique(MF[,c(1,2)])
+	rownames(MF_mtx) <- MF_mtx[,1]
+
+	CC <- do.call(rbind, lapply(GeneGOsets,function(Geneset){Geneset[[3]]}))
+	CC_mtx <- unique(CC[,c(1,2)])
+	rownames(CC_mtx) <- CC_mtx[,1]
+	
+	for(i in 1:numSets){
+		if(dim(BP_mtx)[[1]]>0){
+			BP_mtx[,i+2] <- NA
+			BP_mtx[as.character(GeneGOsets[[i]][[1]][,1]),i+2] <- GeneGOsets[[i]][[1]][,10]
+			colnames(BP_mtx)[i+2] <- names(GeneGOsets)[[i]]
+		}
+		if(dim(MF_mtx)[[1]]>0){	
+			MF_mtx[,i+2] <- NA
+			MF_mtx[as.character(GeneGOsets[[i]][[2]][,1]),i+2] <- GeneGOsets[[i]][[2]][,10]
+			colnames(MF_mtx)[i+2] <- names(GeneGOsets)[[i]]
+		}
+		if(dim(CC_mtx)[[1]]>0){
+			CC_mtx[,i+2] <- NA
+			CC_mtx[as.character(GeneGOsets[[i]][[3]][,1]),i+2] <- GeneGOsets[[i]][[3]][,10]
+			colnames(CC_mtx)[i+2] <- names(GeneGOsets)[[i]]
+		}
+	}
+	
+	list(BP= BP_mtx, MF=MF_mtx, CC=CC_mtx)
+}
+
+############################
+matchTSSpatterns<- function(GeneIDs, Pattern, direction=c("upstream", "downstream", "both"), Length=5000, mart=mart, Sequence=NULL, ...){
+#fixed=TRUE, max.mismatch=0
+
+	result <- data.frame(IDs = GeneIDs)
+	rownames(result) <- GeneIDs
+
+	if(missing(Sequence)){
+		Sequence<- biomaRt::getSequence(id = GeneIDs, type = "refseq_mrna", seqType = "transcript_exon_intron", upstream = Length, mart = mart)
+		Sequence <- Sequence[as.character(Sequence[,2]) %in% GeneIDs,]
+		result[as.character(Sequence[,2]), "Sequence"] <- Sequence[,1]
+	}
+	
+		result[as.character(Sequence[,2]),"PatternCount_Upstream"] <- apply(Sequence,1, function(row){	ifelse(is.na(row[1]), NA, countPattern(Pattern, DNAString(substr(row[1], 1,Length)), ...)) }) 
+		result[as.character(Sequence[,2]),"PatternCount_Downstream"] <- apply(Sequence,1, function(row){ifelse(is.na(row[1]),NA,countPattern(Pattern, DNAString(substr(row[1], Length+1, min(nchar(row[1]), 2*Length))), ...)) })
+		result[as.character(Sequence[,2]),"PatternCount"] <- apply(Sequence,1, function(row){ifelse(is.na(row[1]),NA,countPattern(Pattern, DNAString(substr(row[1], 1, min(nchar(row[1]), 2*Length))), ...) )})
+
+		PatternMatch_Upstream<- apply(Sequence,1, function(row){if(is.na(row[1])){NA}else{matchPattern(Pattern, DNAString(substr(row[1], 1,Length)), ...)} })
+		PatternMatch_Downstream<- apply(Sequence,1, function(row){if(is.na(row[1])){NA}else{matchPattern(Pattern, DNAString(substr(row[1], Length+1, min(nchar(row[1]), 2*Length))), ...)} })
+		result[as.character(Sequence[,2]), "PatternPositions_Upstream"] <- unlist(lapply(PatternMatch_Upstream, function(Match){
+				if(length(Match)==0 || is.na(Match)){ matchpos <- NA
+				} else{ matchpos <- paste(start(ranges(Match))-Length, collapse=", ")}
+				matchpos
+				}) )
+		result[as.character(Sequence[,2]), "PatternPositions_Downstream"] <- unlist(lapply(PatternMatch_Downstream, function(Match){
+				if(length(Match)==0 || is.na(Match)){ matchpos <- NA
+				} else{ matchpos <- paste(start(ranges(Match)), collapse=", ")}
+				matchpos
+				}) )
+
+	return(result)
+}
+
+###########################
+plot_TFBS_refseq_Expression <- function(PatternMatch, Expression, IDs2Match, ExprCol, ExprSymCol, Length, Title, Plot="None"){
+
+	Matched<- merge(Expression[IDs2Match, c(1,ExprSymCol)], PatternMatch, by.x="Refseq_g", by.y="IDs")
+	rownames(Matched) <-Matched$ID
+	Matched<- Matched[nchar(Matched$Sequence)>2 ,]
+	
+	Matched$Expression1 <- Expression[rownames(Matched), ExprCol[1]]
+	Matched$Expression2 <- Expression[rownames(Matched), ExprCol[2]]
+	Distances_Up<- sapply(Matched$PatternPositions_Upstream, function(pos){strsplit(pos, ", ")})
+	Matched$MinDistTSS_Up <- unlist(lapply(Distances_Up, min)); 
+	Distances_Down<- sapply(Matched$PatternPositions_Downstream, function(pos){strsplit(pos, ", ")})
+	Matched$MinDistTSS_Down <- unlist(lapply(Distances_Down, min)) 
+	Matched$MinDistTSS <- apply(cbind(as.numeric(Matched$MinDistTSS_Up), as.numeric(Matched$MinDistTSS_Down)), 1, function(matchDist){
+		if(is.na(matchDist[1])){dist<- matchDist[2]
+		} else if (is.na(matchDist[2])){dist <- matchDist[1]
+		} else{ dist <- ifelse(abs(matchDist[1])<matchDist[2],matchDist[1], matchDist[2]) }
+		dist
+	})
+	
+	Matched$DistEbox <- apply(cbind(Distances_Up, Distances_Down), 1, function(matchDist){
+		if(is.na(matchDist[1]) & is.na(matchDist[2])) {De <- NA
+		}else {
+			if(is.na(matchDist[1])){dist<- as.numeric(matchDist[[2]])
+			} else if (is.na(matchDist[2])){dist <- as.numeric(matchDist[[1]])
+			} else{ dist <- c(as.numeric(matchDist[[1]]), as.numeric(matchDist[[2]])) }
+			
+			Ci <- sapply(dist, function(Dij){
+					Dbtw <- dist-Dij
+					sum(1/abs(Dbtw[Dbtw!=0]))
+				})
+			
+			De <- sum(1/abs(dist)*(1-Ci))
+		}
+		De
+	})
+		## De weighted so E boxes closer to each other and TSS approach 0
+	if(Plot=="All"){
+		par(mfcol=c(2,5))
+		plot(table(Matched$PatternCount_Upstream),  main="Ebox Distribution, 5K Upstream", xlab="Number of Eboxes", ylab="Frequency")
+		hist(Matched$MinDistTSS, main=Title, xlab="Minimum Ebox Distance", breaks=20, col="black")
+		plot(table(Matched$PatternCount_Downstream),  main="Ebox Distribution, 5K Downstream", xlab="Number of Eboxes", ylab="Frequency")
+		plot(Matched$MinDistTSS, Matched$Expression1, pch=19, xlab="Minimum Ebox Distance", ylab=paste("LogFC ", names(Expression)[ExprCol[1]], sep=""))
+		plot(table(Matched$PatternCount),  main="Ebox Distribution, 5K Up & Downstream", xlab="Number of Eboxes", ylab="Frequency")
+		plot(Matched$MinDistTSS, Matched$Expression2, pch=19, xlab="Minimum Ebox Distance", ylab=paste("LogFC ", names(Expression)[ExprCol[2]], sep=""))
+		plot(Matched$PatternCount, Matched$Expression1, pch=19, xlab="Number of Eboxes", ylab=paste("LogFC ", names(Expression)[ExprCol[1]], sep=""))
+		plot(Matched$PatternCount, Matched$Expression2, pch=19, xlab="Number of Eboxes", ylab=paste("LogFC ", names(Expression)[ExprCol[2]], sep=""))
+		plot(-1*log(Matched$DistEbox), Matched$Expression1, pch=19, xlab="Inv. Distances of Eboxes", ylab=paste("LogFC ", names(Expression)[ExprCol[1]], sep=""))
+		plot(-1*log(Matched$DistEbox), Matched$Expression2, pch=19, xlab="Inv. Distances of Eboxes", ylab=paste("LogFC ", names(Expression)[ExprCol[2]], sep=""))
+	} else if(Plot=="Few"){
+		par(mfcol=c(2,2))
+		hist(Matched$MinDistTSS, main=Title, xlab="Minimum Ebox Distance", breaks=20, col="black")
+
+		plot(Matched$Expression1, Matched$Expression2, pch=19, xlab=paste("LogFC ", names(Expression)[ExprCol[1]], sep=""), ylab=paste("LogFC ", names(Expression)[ExprCol[2]], sep=""), cex=0.6)
+
+		plot(Matched$MinDistTSS, Matched$Expression1, pch=19, xlab="Minimum Ebox Distance", ylab=paste("LogFC ", names(Expression)[ExprCol[1]], sep=""))
+		plot(Matched$MinDistTSS, Matched$Expression2, pch=19, xlab="Minimum Ebox Distance", ylab=paste("LogFC ", names(Expression)[ExprCol[2]], sep=""))
+	}
+	
+	return(Matched)
+}
+
+###########################
+get_TFBS_stats <- function(PatternMatch){
+
+	
+	Distances_Up<- sapply(as.character(PatternMatch$PatternPositions_Upstream), function(pos){strsplit(pos, ", ")})
+	PatternMatch$MinDistTSS_Up <- unlist(lapply(Distances_Up, min)); 
+	Distances_Down<- sapply(as.character(PatternMatch$PatternPositions_Downstream), function(pos){strsplit(pos, ", ")})
+	PatternMatch$MinDistTSS_Down <- unlist(lapply(Distances_Down, min)) 
+	PatternMatch$MinDistTSS <- apply(cbind(as.numeric(PatternMatch$MinDistTSS_Up), as.numeric(PatternMatch$MinDistTSS_Down)), 1, function(matchDist){
+		if(is.na(matchDist[1])){dist<- matchDist[2]
+		} else if (is.na(matchDist[2])){dist <- matchDist[1]
+		} else{ dist <- ifelse(abs(matchDist[1])<matchDist[2],matchDist[1], matchDist[2]) }
+		dist
+	})
+	
+	return(PatternMatch)
+}
+
+############ Kaplan Meier curves: KM plots ###########################
+KMfit <- function(KMdir, subsetString = "", KMFiles=NULL){
+
+	if(missing(KMFiles)){KMFiles <- list.files(path = KMdir)}
+	km_fit <- lapply(KMFiles, function(km_file){
+		kms<- read.table(paste(KMdir,km_file, sep=""), sep="\t", header=T)
+		names(kms) <- c("Sample", "Log2", "GeneGroup", "EventFreeDays", "Event")
+
+		kms[kms$Event=="A","status"] = 0
+		kms[kms$Event=="D","status"] = 1
+	#	msurv <- Surv(time=kms$EventFreeDays, event=kms$status)
+	#	survdiff(Surv(EventFreeDays, status == 1) ~ GeneGroup, data = kms)
+		
+		if(subsetString != ""){
+			mfit <- survfit(formula=Surv(EventFreeDays, status==1)~ GeneGroup, data=kms, subset=grep(subsetString, kms[,1])) 
+		} else{ 
+			mfit <- survfit(formula=Surv(EventFreeDays, status==1)~ GeneGroup, data=kms) 
+		}
+		mfit
+		
+	})
+	
+	km_fit
+}
+
+########################
+aggregate_KMfiles <- function(KMdir, subsetString = "", KMFiles=NULL){
+
+	if(missing(KMFiles)){KMFiles <- list.files(path = KMdir)}
+	KM_Table <- read.table(paste(KMdir,KMFiles[1], sep=""), sep="\t", header=T)
+	names(KM_Table) <- c("Sample", "Log2", "GeneGroup", "EventFreeDays", "Event")
+		KM_Table[KM_Table$Event=="A","status"] = 0
+		KM_Table[KM_Table$Event=="D","status"] = 1
+	KM_Table <- KM_Table[,c("Sample", "EventFreeDays", "Event", "status")]
+
+	GeneID<-unlist(lapply(KMFiles, function(file){sub(".txt","",sub("kms", "", file))}))
+	km_info <- lapply(KMFiles, function(km_file){
+		kms<- read.table(paste(KMdir,km_file, sep=""), sep="\t", header=T)
+#		names(kms) <- c("Sample", "Log2", "GeneGroup", "EventFreeDays", "Event")
+		kms[,2:3]
+	})
+	names(km_info)<-GeneID
+
+	KM_ExprTable<-cbind(KM_Table,lapply(km_info, function(gene){as.numeric(gene[,1])}))
+	KM_GeneGroupTable <- cbind(KM_Table,lapply(km_info, function(gene){as.numeric(gene[,2])}))
+	
+	return(list(KM_GeneExpr=KM_ExprTable, KM_GeneGroup=KM_GeneGroupTable))
+}
+
+#######################
+KMfit_file <- function(KMfile, subsetString = ""){
+
+	kms<- read.table(KMfile, sep="\t", header=T)
+	
+	if(subsetString != ""){
+		mfit <- survfit(formula=Surv(EventFreeDays, status==1)~ GeneGroup, data=kms, subset=grep(subsetString, kms[,1])) 
+	} else{ 
+		mfit <- survfit(formula=Surv(EventFreeDays, status==1)~ GeneGroup, data=kms) 
+	}
+	mfit
+}
+
+###########################
+KMplot <- function(KMfit, colors=c("blue", "red"), add=FALSE, Title=""){
+
+	if(class(KMfit)=="list"){
+		if(!add){ plot(KMfit[[1]], col=colors, main=Title) }
+		lapply(KMfit, function(km_mfit){
+				lines(km_mfit, col=colors)
+		})
+	}else{
+		if(!add){ plot(KMfit, col=colors, main=Title)
+		} else{	lines(KMfit, col=colors)
+		}
+	}
+}
+
+##########################
+write_KM_aggregate <- function(Dir, file, subset=NULL){
+
+	KMFiles <- list.files(path = Dir)
+	if(!missing(subset)){ 
+		subsetFiles <- paste("kms", subset, ".txt", sep="")
+		cat(paste("Total: ", length(KMFiles)))
+		KMFiles<- intersect(KMFiles, subsetFiles)
+		cat(paste("\nsubset: ", length(subsetFiles), "\nintersect: ", length(KMFiles), "\n"))
+	}
+	write(paste("Sample", "Log2","GeneGroup","EventFreeDays","Event","status", sep="\t"), file=file)
+	kmData <- lapply(KMFiles, function(km_file){
+		kms<- read.table(paste(Dir,km_file, sep=""), sep="\t", header=T)
+		names(kms) <- c("Sample", "Log2", "GeneGroup", "EventFreeDays", "Event")
+		kms[kms$Event=="A","status"] = 0
+		kms[kms$Event=="D","status"] = 1
+		
+		write.table(kms, file=file, sep="\t", quote=F, row.names=F, col.names=F, append=T)
+	})
+}	
+
+##########################
+extract_SigProbes_fromTopTableFit <- function(fit, alpha, rootFile=NULL){
+	
+		SigIDs <- list()
+		contrasts <- names(topTable(fit))[-c(1:2,length(names(topTable(fit)))-0:3)]
+	
+		for(i in 1:length(contrasts)){
+			MeetPval <- topTable(fit, coef=i, number=length(fit$F), p.value=alpha)
+			SigIDs[[contrasts[i]]]$"Either" <- as.character(MeetPval$ID)
+			SigIDs[[contrasts[i]]]$"Up" <- as.character(MeetPval[which(MeetPval$logFC>0), "ID"])
+			SigIDs[[contrasts[i]]]$"Down" <- as.character(MeetPval[which(MeetPval$logFC<0), "ID"])
+		}
+		
+		if(!missing(rootFile)){	
+			write.table(paste(rootFile,"AllCompare_topTable.txt", sep="_"), x=topTable(fit, number=length(fit$F)), quote=F, col.names=T, row.names=F, sep="\t")		
+
+			for(i in 1:length(contrasts)){
+				write.table(paste(rootFile,contrasts[i],"topTable.txt", sep="_"), x=topTable(fit, coef=i, number=length(fit$F)), quote=F, col.names=T, row.names=F, sep="\t")
+			}
+		}
+		return(SigIDs)
+} 
+#######################################
+extract_SigProbes_fromDataTable <- function(DataTable, DirCols, contrasts){
+	
+		SigIDs <- list()
+	
+		for(i in 1:length(contrasts)){
+			SigIDs[[contrasts[i]]]$"Either" <- as.character(DataTable[DataTable[,DirCols[i]] %in% c("+", "-"),"ID"])
+			SigIDs[[contrasts[i]]]$"Up" <- as.character(DataTable[DataTable[,DirCols[i]] == "+","ID"])
+			SigIDs[[contrasts[i]]]$"Down" <- as.character(DataTable[DataTable[,DirCols[i]] == "-","ID"])
+		}
+		
+		return(SigIDs)
+} 
+
+##########################
+makeCDTfile <- function(CDTfile, DataTable = MycMondo_FCdir, IndicatorColumns = c(5+MycMondo_si, which(colnames(MycMondo_FCdir) == "MycMondo_Coop")),ColNames = c(Tests, "MycMondoCoop"), IDName="Symbol" ){
+
+	#reads in CDT file from Treeview and creates indicator file in same gene order, original CDT file to be IDs
+	
+	Tree <- read.table(CDTfile, header=T, sep="\t")
+	Tree_FCdir <- apply(DataTable[as.character(Tree[-1,"NAME"]),IndicatorColumns],2,as.character); rownames(Tree_FCdir) <- as.character(Tree[-1,"NAME"])
+	Tree_FCdir[Tree_FCdir == "-"] <- -1
+	Tree_FCdir[Tree_FCdir == "+"] <- 1	
+	Tree_FCdir <- cbind(as.character(Tree[-1,1]),as.character(DataTable[rownames(Tree_FCdir),IDName]),as.character(DataTable[rownames(Tree_FCdir),IDName]), Tree[-1,4], Tree_FCdir)
+	Tree_FCdir <- rbind(c("EWEIGHT", NA, NA, NA, rep(1, length(IndicatorColumns))), Tree_FCdir)
+	colnames(Tree_FCdir) <- c("GID", "ID", "NAME", "GWEIGHT", ColNames)
+		
+	return(Tree_FCdir)
+}
+
+##########################
+makeCDTfile_byArray <- function(CDTfile, DataTable,ValRows,RowNames, IDName=NULL ){
+
+	#reads in CDT file from Treeview and creates a file in same gene order of other values, original CDT file to be IDs
+	
+	Tree <- read.table(CDTfile, header=T, sep="\t")
+	Tree_FCdir <- DataTable[RowNames, colnames(Tree)[-c(1:4)]]; 
+#	Names <- ifelse(missing(IDName),rownames(DataTable)[ValRows], as.character(DataTable[rownames(Tree_FCdir),IDName]))
+	Tree_FCdir <- cbind(as.character(Tree[-c(1:2),1])[1:dim(Tree_FCdir)[1]],RowNames,RowNames, Tree[-c(1:2),4][1:dim(Tree_FCdir)[1]], Tree_FCdir)
+	colnames(Tree_FCdir) <- colnames(Tree)
+	Tree_FCdir <- rbind(Tree[1:2,], Tree_FCdir)
+		
+	return(Tree_FCdir)
+}
+
+###########################
+	getLDA<-function(Expression, Samples, Groups){
+		LDA<- lda(x=t(Expression[,Samples]), grouping=Groups)
+		LDA$scores <- t(Expression) %*% LDA$scaling
+		
+		return(LDA)
+	}
+
+############################
+
+Kmeans_BIC <- function(k, Data){
+
+	#Data has N Observations and P samples
+	#k has rownames corresponding to Data and 1 column representing k-means cluster
+	# rownames need not be in same order
+	
+	N_k <- table(k)
+		#Number of observations in each cluster
+	K <- length(N_k)
+		# Number of clusters
+	N <- dim(Data)[[1]]; P<- dim(Data)[[2]]
+		
+	V_k<-sapply(rownames(N_k), function(cluster){
+		apply(Data[rownames(k)[k==cluster],],2, var)})
+	V <- apply(Data,2, var); V <- matrix(rep(V,K),ncol=K,byrow=F)
+	
+	LL <- 0.5*N_k* colSums( log(V_k + V))
+	BIC <- -2*sum(LL)+2*K*P*log(N)
+	AIC = -2 *sum(LL) + 4*K*P
+	
+	cat("BIC: ", BIC, "\tAIC: ", AIC, "\n") 
+}
+
+##############################
+
+error.bar <- function(x, y, upper, lower=upper, length=0.1,...){
+	
+	# barx <- barplot(y.means)
+	# error.bar(barx,y.means, 1.96*y.sd/10)
+	
+    if(length(x) != length(y) | length(y) !=length(lower) | length(lower) != length(upper))
+    stop("vectors must be same length")
+
+    arrows(x,y+upper, x, y-lower, angle=90, code=3, length=length, ...)
+}
+
+###############################
+std_error <- function(x) sd(x)/sqrt(length(x))
+
+###############################
+SESkewness <- function(n) sqrt((6*n*(n-1))/((n-2)*(n+1)*(n+3)))
+
+###############################
+SEKurtosis <- function(n) 2*SESkewness(n)*sqrt((n^2-1)/((n-3)*(n+5)))
+
+################################
+ReportKurtosis <- function(Observed,Expected,Subset){
+
+	for(i in 1:length(EboxSeqs)){
+
+		O<- Observed[[EboxSeqs[i]]][Subset,"MinDistTSS"]
+		E <- Expected[[EboxSeqs[i]]]$MinDistTSS
+
+		Z_Kurtosis_Obs <- kurtosis(O, type=2, na.rm=T)/SEKurtosis(length(O))
+		Z_Kurtosis_Exp <- kurtosis(E, type=2, na.rm=T)/SEKurtosis(length(E))
+	cat(paste(EboxSeqs[i], ": ", Z_Kurtosis_Obs, " (Observed), ", Z_Kurtosis_Exp, " (Expected)\n"))
+	}
+}
+
+################################
+plot_TCGA_KMcurves <- function(Samplelist, SampleNames, SignatureCols, test=c("simpleT", "sigT")){
+	par(mfcol=c(2,4)); 
+
+	if(missing(SignatureCols)){ 
+		SignatureCols<- lapply(Samplelist, function(Sampledata){ 
+	 		setdiff(1:dim(Sampledata)[[2]], which(colnames(Sampledata) %in% c("status", "EventFreeDays")))
+		})
+	}
+	
+	SurvDiff<- lapply(1:length(Samplelist), function(i){ Sampledata <- Samplelist[[i]]
+		Sampledata$tTest <- 0
+	
+	if(test=="simpleT"){
+		Sampledata$tTest[which(apply(Sampledata[,SignatureCols[[i]]],1,function(Vals){ t.test(Vals)$statistic})>0)] <-1
+		plot(survfit(formula=Surv(EventFreeDays, status==1)~ tTest, data=Sampledata), col=c("red", "blue"), xlab="Days", ylab="Survival Probability", main=TumorTypes[i])	
+		t<- survdiff(formula=Surv(EventFreeDays, status==1)~ tTest, data=Sampledata)
+	}else if (test=="sigT"){
+		Ttest <- apply(Sampledata[,SignatureCols[[i]]],1,function(Vals){ t.test(Vals)})
+		Sampledata$tTest[unlist(lapply(Ttest,function(t){t$statistic >0 & t$p.value<0.05}))] <-2
+		Sampledata$tTest[unlist(lapply(Ttest,function(t){t$statistic <0 & t$p.value<0.05}))] <-1
+		plot(survfit(formula=Surv(EventFreeDays, status==1)~ tTest, data=Sampledata), col=c("grey", "red", "blue"), xlab="Days", ylab="Survival Probability", main=TumorTypes[i])	
+		t<- survdiff(formula=Surv(EventFreeDays, status==1)~ tTest, data=Sampledata, subset=(tTest %in% c(1,2)))
+	}
+	t
+	})
+	names(SurvDiff)<- SampleNames
+	invisible(SurvDiff)
+}
+
+##############################	
+create_TCGA_KMfile<- function(Type){
+
+	folder<- paste("TCGA/TCGA_", Type, "_exp_HiSeqV2_exon-2013-09-07", sep="")
+	#untar(paste("TCGA/TCGA_", Type, "_exp_HiSeqV2_exon-2013-09-07.tar", sep=""))
+	Expr <- read.delim(file=paste(folder, "/HiSeqV2_exon", sep=""), header=T,sep="\t", row.names=1)
+	Clinical <-  read.delim(file=paste(folder, "/", Type, "_clinicalMatrix", sep=""), header=T,sep="\t", row.names=1)
+	
+	Expr2 <- t(Expr)
+	rownames(Expr2) <- sub("^X","",rownames(Expr2)); rownames(Expr2) <- gsub("\\.","-",rownames(Expr2))
+	Expr_KM<- data.frame(status =Clinical[rownames(Expr2), "X_EVENT"], EventFreeDays = Clinical[rownames(Expr2), "X_TIME_TO_EVENT"], Expr2)
+	Expr_KM
+}
+
+##############################
+get_TCGA_KMsubset<- function(Type, FullData, Symbols, center=c("none","median", "mean"), Expresstype=c("exon", "gene") ){
+
+	folder<- ""
+	IDmap<- data.frame()
+	if(Expresstype=="exon"){
+		folder<- paste("TCGA/TCGA_", Type, "_exp_HiSeqV2_exon-2013-09-07", sep="")
+		IDmap<- read.table(file=paste(folder, "/unc_v2_exon_hg18_probe", sep=""), header=F,sep="\t")
+	}else if(Expresstype=="gene"){
+		folder<- paste("TCGA/TCGA_", Type, "_exp_HiSeqV2-2013-09-07", sep="")
+		IDmap<- read.table(file=paste(folder, "/collapsed_hugo_symbols_aliases_only_hg18.probeMap", sep=""), header=F,sep="\t")
+	}
+	colnames(IDmap)<- c("Gene", "Symbol", "chr",  "start", "end", "strand")
+
+	IDsubset <- IDmap$chrID[which(IDmap$Symbol %in% Symbols)]
+	IDsubset <- gsub("[-+:]","\\.",IDsubset)
+	
+	Expr_subset<- FullData[,IDsubset]
+	if(center=="median"){
+		Expr_subset<- apply(Expr_subset,2,function(colmn){colmn-median(colmn)})
+	} else if (center=="mean"){
+		Expr_subset<- apply(Expr_subset,2,function(colmn){colmn-mean(colmn)})
+	}
+	Expr_subset<- data.frame(status=FullData[,"status"], EventFreeDays=FullData[,"EventFreeDays"],Expr_subset)
+	Expr_subset
+}		
+
+#############################
+makeDAVIDbarplot<- function(DAVIDtable, alpha=0.05, Subset=NULL, PlotMargins=NULL, color="black", PlotFile=NULL){
+	
+		DAVIDtable<-DAVIDtable[DAVIDtable$Benjamini<alpha,]
+		if(!missing(Subset)) DAVIDtable<- DAVIDtable[Subset,]
+		Names<- DAVIDtable$Term; 
+		Names <- sub(".+~","", Names);	Names <- sub(".+:","", Names)
+	
+		if(!missing(PlotMargins)) par(mar=PlotMargins)
+		barplot(-1*log(DAVIDtable$Benjamini, 10), names.arg=Names, col=color, las=2, cex.names=1, ylab="-log(p)", width=0.55)
+		if(!missing(PlotFile)) dev.copy2pdf(file=PlotFile)
+
+		DAVIDtable
+	}
+
+####################################################
+makeDAVIDCategoryPlot <- function(DavidList,alpha=0.05, PlotMargins=NULL, displaySubset=NULL, displayNotSig=TRUE, removeGO=F, addPercent=F, ... ) {
+	
+		SigTermsList <-lapply(DavidList, function(DavidTable){DavidTable[DavidTable$Benjamini<alpha,"Term"]})	
+		SigTerms <- unique(unlist(SigTermsList))
+		SigTerms_PossibleCount <- sapply(SigTerms, function(term){ term<- as.character(term);
+			ifelse(term %in% DavidList[[1]][,"Term"], DavidList[[1]][as.character(DavidList[[1]][,"Term"])==term,"List.Total"], DavidList[[2]][as.character(DavidList[[2]][,"Term"])==term,"List.Total"])})	
+		
+		OverlapCount<- sapply(SigTerms, function(term){
+			term<- as.character(term)
+			GeneList<- lapply(DavidList, function(DavidTable){ 
+	#			DavidTable<- DavidTable[!duplicated(DavidTable$Term),]
+				ifelse(term %in% DavidTable$Term, as.character(DavidTable[as.character(DavidTable$Term)==term,"Genes"]), "")})
+			if(length(GeneList)==2){
+		  		Agenes<- strsplit(GeneList[[1]], ", ")[[1]]; Bgenes<- strsplit(GeneList[[2]], ", ")[[1]]
+	  			OnlyA <- setdiff(Agenes, Bgenes); OnlyB <- setdiff(Bgenes, Agenes); AandB <- intersect(Agenes, Bgenes)
+  				overlap <- c(length(OnlyA), length(OnlyB), length(AandB))
+  				#overlap <- list(OnlyA=OnlyA, OnlyB=OnlyB,Both=AandB)
+  				names(overlap)<- c(names(GeneList), "Both" )
+		    	overlap
+			}
+		})
+		colnames(OverlapCount)<- SigTerms
+		if(removeGO) colnames(OverlapCount) <-  sub(".+~","", colnames(OverlapCount));	
+		NumReg<- colSums(OverlapCount)
+		OverlapCount<-rbind(OverlapCount, NotReg=SigTerms_PossibleCount-NumReg)
+		
+		if(missing(displaySubset)) displaySubset= seq(1, dim(OverlapCount)[[2]])
+		if(!missing(PlotMargins))par(mar=PlotMargins)
+
+		color<- c("red", "black")
+		bplot<-	barplot(OverlapCount[c(1,3,2),displaySubset], plot=F, ...)
+		if(displayNotSig){	bplot<-	barplot(OverlapCount[c(1,3,2,4),displaySubset], col=c("red", "orange", "yellow", "grey"), las=2, ...)
+
+		} else{ 			bplot<-	barplot(OverlapCount[c(1,3,2),displaySubset], col=c("red", "orange", "yellow"), las=2, ...)}
+		
+		if(addPercent){	
+			Percent<- lapply(DavidList, function(DavidTable){
+				perc<- DavidTable[match(SigTerms[displaySubset], DavidTable$Term), "X."]
+				perc[is.na(perc)]<-0
+				perc })
+			ymax <- max(unlist(Percent))
+			par(new=T)
+			plot(y=bplot, x= Percent[[1]],xlim=c(0,ymax+1), type="l", pch=19, col=color[1], lwd=3, axes=F, ylab="", xlab="")
+#			plot(y=bplot, x= Percent[[1]], type="l", pch=19, col=color[1], lwd=3, axes=F, ylab="", xlab="")
+			sapply(2:length(Percent), function(i){
+				lines(y=bplot, x= Percent[[i]], type="l", pch=19, col=color[i], lwd=3, ylab="", xlab="")})
+			axis(3, ylim=c(0,ymax),lwd=2)
+}
+		OverlapCount
+}
+
+####################################################
+makeDAVIDCategoryDotPlot <- function(DavidList,alpha=0.05, PlotMargins=NULL, displaySubset=NULL) {
+	
+		SigTermsList <-lapply(DavidList, function(DavidTable){DavidTable[DavidTable$Benjamini<alpha,"Term"]})	
+		SigTerms <- unique(unlist(SigTermsList))
+		
+		Overlap<- sapply(SigTerms, function(term){
+			term<- as.character(term)
+			GeneList<- lapply(DavidList, function(DavidTable){ 
+	#			DavidTable<- DavidTable[!duplicated(DavidTable$Term),]
+				percent<- ifelse(term %in% DavidTable$Term, DavidTable[as.character(DavidTable$Term)==term,"X."], 0)
+				as.numeric(percent)
+			})
+			unlist(GeneList)
+		})
+			
+		colnames(Overlap)<- SigTerms
+
+		if(orderPerc) Subset <- Subset[order(DavidTable[Subset, "X."])]
+
+		dotchart(DavidTable[Subset,"X."], labels=DavidTable[Subset,"Term"])
+
+
+ }
